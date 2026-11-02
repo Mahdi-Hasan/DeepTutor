@@ -563,6 +563,80 @@ class TestContextBuilderSummarize:
 
 
 # ---------------------------------------------------------------------------
+# chat/context_summary_agent prompt pack
+# ---------------------------------------------------------------------------
+
+
+class TestContextSummaryPromptPack:
+    @pytest.mark.parametrize("language", ["en", "zh"])
+    def test_prompt_pack_resolves_without_missing_resource_warning(
+        self, language: str, capsys: pytest.CaptureFixture[str], monkeypatch
+    ) -> None:
+        from build_support import owner
+        from deeptutor.runtime.home import PACKAGE_ROOT
+        from deeptutor.services.prompt import get_prompt_manager
+        from deeptutor.services.session.context_builder import _ContextSummaryAgent
+
+        monkeypatch.setattr("deeptutor.agents.base_agent.get_agent_params", lambda _module: {})
+        manager = get_prompt_manager()
+        manager.clear_cache("chat")
+
+        prompts = manager.load_prompts("chat", "context_summary_agent", language)
+        agent = _ContextSummaryAgent(language=language)
+
+        assert "No prompt file found" not in capsys.readouterr().out
+        for key in ("system", "user_template", "replay_instruction"):
+            assert isinstance(prompts.get(key), str) and prompts[key].strip()
+        assert agent.prompts == prompts
+        # The core wheel ships the pack: no feature module owns agents/chat.
+        resource = PACKAGE_ROOT / f"deeptutor/agents/chat/prompts/{language}"
+        resource = resource / "context_summary_agent.yaml"
+        assert resource.is_file()
+        assert owner(resource.relative_to(PACKAGE_ROOT).as_posix()) == "core"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("language", ["en", "zh", "ja"])
+    async def test_summarize_sends_the_prompt_pack(self, language: str) -> None:
+        from deeptutor.services.prompt import get_prompt_manager
+        from deeptutor.services.prompt.language import language_label
+
+        captured: dict[str, Any] = {}
+
+        async def _stream_llm(**kwargs: Any):
+            captured.update(kwargs)
+            yield "short summary"
+
+        agent = MagicMock()
+        agent.stream_llm = _stream_llm
+        builder = ContextBuilder(store=MagicMock())
+        replay = {"messages": [{"role": "user", "content": "hello"}], "tools": None}
+
+        with patch(
+            "deeptutor.services.session.context_builder._ContextSummaryAgent",
+            return_value=agent,
+        ):
+            await builder._summarize(
+                session_id="s1",
+                language=language,
+                source_text="User: {not a placeholder}",
+                summary_budget=50,
+                replay_request=replay,
+            )
+
+        # Non-Chinese sessions use the English pack plus a language directive.
+        pack = "zh" if language == "zh" else "en"
+        prompts = get_prompt_manager().load_prompts("chat", "context_summary_agent", pack)
+        system = prompts["system"].format(summary_language=language_label(language))
+        assert captured["system_prompt"] == system
+        assert captured["user_prompt"] == prompts["user_template"].format(
+            target_tokens=40, source_text="User: {not a placeholder}"
+        )
+        assert captured["messages"][-1]["content"] == (
+            f"{system}\n\n{prompts['replay_instruction'].format(target_tokens=40)}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # ContextBuilder.build — summarize paths (rebuild / fold-in / failure / branch)
 # ---------------------------------------------------------------------------
 
